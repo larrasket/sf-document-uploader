@@ -8,7 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -30,9 +30,7 @@ const (
 
 	clientID    = "3MVG9CmdhfW8tOGCdf5CPNqN58A4eHJFXV_qMITEB_XMGHAUPHLFTWOejtNXvvOjaLCl0s41X6OPPB.U._3xO"
 	redirectURI = "http://localhost:8080/oauth/callback"
-)
 
-const (
 	DocTypeBuildingLocation = "Building Location"
 	DocTypeFinish           = "Finish"
 	DocTypeFloorPlan        = "Floor Plan"
@@ -40,9 +38,7 @@ const (
 	DocTypeProjectPlan      = "Project Plan"
 	DocTypeUnitPlan         = "Unit Plan"
 	DocTypeGeneric          = "Generic Document"
-)
 
-const (
 	ContentTypeImage = "Image"
 	ContentTypePDF   = "PDF"
 	ContentTypeVideo = "Video"
@@ -154,22 +150,6 @@ func authenticate() (*TokenResponse, error) {
 	return exchangeCodeForToken(code, codeVerifier)
 }
 
-func processDocument(accessToken string, doc DocumentInfo) error {
-	contentDocId, err := uploadContentDocument(accessToken, doc)
-	if err != nil {
-		return fmt.Errorf("content document upload failed: %v", err)
-	}
-
-	attachment := AttachmentUploader{
-		AttachmentType:    doc.DocumentType,
-		ContentType:       doc.ContentType,
-		ContentDocumentId: contentDocId,
-		Name:              filepath.Base(doc.FilePath),
-	}
-
-	return createAttachmentUploader(accessToken, attachment)
-}
-
 func generateCodeVerifier(length int) string {
 	bytes := make([]byte, length)
 	rand.Read(bytes)
@@ -206,108 +186,6 @@ func exchangeCodeForToken(code, codeVerifier string) (*TokenResponse, error) {
 	return &tokenResp, nil
 }
 
-func uploadContentDocument(accessToken string, doc DocumentInfo) (string, error) {
-	logger := NewLogger()
-
-	file, err := os.Open(filepath.Join("./documents", doc.FilePath))
-	if err != nil {
-		return "", fmt.Errorf("error opening file: %v", err)
-	}
-	defer file.Close()
-
-	fileBytes, err := ioutil.ReadAll(file)
-	if err != nil {
-		return "", fmt.Errorf("error reading file: %v", err)
-	}
-
-	jsonData := map[string]interface{}{
-		"Title":        filepath.Base(doc.FilePath),
-		"PathOnClient": filepath.Base(doc.FilePath),
-		"VersionData":  base64.StdEncoding.EncodeToString(fileBytes),
-	}
-
-	jsonBytes, err := json.Marshal(jsonData)
-	if err != nil {
-		return "", fmt.Errorf("error marshaling JSON: %v", err)
-	}
-
-	uploadURL := sfInstanceURL + "/services/data/v57.0/sobjects/ContentVersion"
-	req, err := http.NewRequest("POST", uploadURL, bytes.NewBuffer(jsonBytes))
-	if err != nil {
-		return "", fmt.Errorf("error creating upload request: %v", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	logger.Info("Uploading file %s to Salesforce", doc.FilePath)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("upload request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := ioutil.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
-		Id                string `json:"id"`
-		Success           bool   `json:"success"`
-		ContentDocumentId string `json:"contentDocumentId"`
-	}
-
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("error decoding upload response: %v", err)
-	}
-
-	logger.Info("Successfully uploaded file. ContentVersion ID: %s, ContentDocument ID: %s",
-		result.Id, result.ContentDocumentId)
-
-	return result.ContentDocumentId, nil
-}
-
-func createAttachmentUploader(accessToken string, attachment AttachmentUploader) error {
-	jsonData, err := json.Marshal(attachment)
-	if err != nil {
-		return fmt.Errorf("error marshaling attachment uploader: %v", err)
-	}
-
-	url := sfInstanceURL + "/services/data/v57.0/sobjects/Attachments_Uploader__c"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("error creating attachment uploader request: %v", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("attachment uploader request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("attachment uploader creation failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	return nil
-}
-
-func generateLookupKey(entityType string, namePath map[string]string) string {
-	lookup := EntityLookup{
-		EntityType: entityType,
-		NamePath:   namePath,
-	}
-	jsonBytes, _ := json.Marshal(lookup)
-	return string(jsonBytes)
-}
-
 type Logger struct {
 	*log.Logger
 }
@@ -318,11 +196,11 @@ func NewLogger() *Logger {
 	}
 }
 
-func (l *Logger) Info(format string, v ...interface{}) {
+func (l *Logger) Info(format string, v ...any) {
 	l.Printf("[INFO] "+format, v...)
 }
 
-func (l *Logger) Error(format string, v ...interface{}) {
+func (l *Logger) Error(format string, v ...any) {
 	l.Printf("[ERROR] "+format, v...)
 }
 
@@ -356,7 +234,7 @@ func performBulkLookup(accessToken string, request BulkLookupRequest) (map[strin
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %v", err)
 	}
@@ -383,15 +261,6 @@ func performBulkLookup(accessToken string, request BulkLookupRequest) (map[strin
 	return results, nil
 }
 
-func getFirstValue(results map[string]string) string {
-	for _, v := range results {
-		if !strings.HasPrefix(v, "ERROR:") {
-			return v
-		}
-	}
-	return ""
-}
-
 func parseFileName(filename string) (*DocumentInfo, error) {
 	parts := strings.Split(filename, "_")
 	if len(parts) < 3 {
@@ -407,6 +276,18 @@ func parseFileName(filename string) (*DocumentInfo, error) {
 	switch parts[0] {
 	case "bl":
 		info.DocumentType = DocTypeBuildingLocation
+	case "f":
+		info.DocumentType = DocTypeFinish
+	case "fp":
+		info.DocumentType = DocTypeFloorPlan
+	case "g":
+		info.DocumentType = DocTypeGallery
+	case "pp":
+		info.DocumentType = DocTypeProjectPlan
+	case "up":
+		info.DocumentType = DocTypeUnitPlan
+	case "gd":
+		info.DocumentType = DocTypeGeneric
 	default:
 		return nil, fmt.Errorf("unknown document type prefix: %s", parts[0])
 	}
@@ -554,18 +435,18 @@ func bulkUploadContentVersions(accessToken string, documents []DocumentInfo) err
 	logger := NewLogger()
 	const batchSize = 25
 
-	var allRequests []map[string]interface{}
+	var allRequests []map[string]any
 	for i, doc := range documents {
-		fileBytes, err := ioutil.ReadFile(filepath.Join("./documents", doc.FilePath))
+		fileBytes, err := os.ReadFile(filepath.Join("./documents", doc.FilePath))
 		if err != nil {
 			return fmt.Errorf("error reading file %s: %v", doc.FilePath, err)
 		}
 
-		request := map[string]interface{}{
+		request := map[string]any{
 			"method":      "POST",
 			"url":         "/services/data/v57.0/sobjects/ContentVersion",
 			"referenceId": fmt.Sprintf("ref%d", i),
-			"body": map[string]interface{}{
+			"body": map[string]any{
 				"Title":                  filepath.Base(doc.FilePath),
 				"PathOnClient":           filepath.Base(doc.FilePath),
 				"VersionData":            base64.StdEncoding.EncodeToString(fileBytes),
@@ -577,13 +458,10 @@ func bulkUploadContentVersions(accessToken string, documents []DocumentInfo) err
 	}
 
 	for i := 0; i < len(allRequests); i += batchSize {
-		end := i + batchSize
-		if end > len(allRequests) {
-			end = len(allRequests)
-		}
+		end := min(i+batchSize, len(allRequests))
 
 		batchRequests := allRequests[i:end]
-		compositeRequest := map[string]interface{}{
+		compositeRequest := map[string]any{
 			"allOrNone":        true,
 			"compositeRequest": batchRequests,
 		}
@@ -613,9 +491,9 @@ func bulkUploadContentVersions(accessToken string, documents []DocumentInfo) err
 
 		var compositeResponse struct {
 			CompositeResponse []struct {
-				Body           interface{} `json:"body"`
-				HttpStatusCode int         `json:"httpStatusCode"`
-				ReferenceId    string      `json:"referenceId"`
+				Body           any    `json:"body"`
+				HttpStatusCode int    `json:"httpStatusCode"`
+				ReferenceId    string `json:"referenceId"`
 			} `json:"compositeResponse"`
 		}
 
@@ -629,7 +507,7 @@ func bulkUploadContentVersions(accessToken string, documents []DocumentInfo) err
 					result.ReferenceId, result.HttpStatusCode)
 			}
 
-			if successBody, ok := result.Body.(map[string]interface{}); ok {
+			if successBody, ok := result.Body.(map[string]any); ok {
 				refIndex, _ := strconv.Atoi(strings.TrimPrefix(result.ReferenceId, "ref"))
 				if refIndex < len(documents) {
 					versionId := successBody["id"].(string)
@@ -762,7 +640,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []DocumentInfo)
 	logger := NewLogger()
 	const batchSize = 25
 
-	var allRequests []map[string]interface{}
+	var allRequests []map[string]any
 	for i, doc := range documents {
 		logger.Info("Processing document: %s", doc.FilePath)
 		logger.Info("ContentDocumentId: %s", doc.ContentDocumentId)
@@ -795,7 +673,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []DocumentInfo)
 
 		displayValue := generateDisplayValue(doc)
 
-		record := map[string]interface{}{
+		record := map[string]any{
 			"Name":                    entityId,
 			"Attachment_Type__c":      doc.DocumentType,
 			"Content_Type__c":         getContentType(doc.FilePath),
@@ -820,7 +698,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []DocumentInfo)
 
 		logger.Info("Creating attachment uploader record: %+v", record)
 
-		request := map[string]interface{}{
+		request := map[string]any{
 			"method":      "POST",
 			"url":         "/services/data/v57.0/sobjects/Attachments_Uploader__c",
 			"referenceId": fmt.Sprintf("attRef%d", i),
@@ -834,13 +712,10 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []DocumentInfo)
 	}
 
 	for i := 0; i < len(allRequests); i += batchSize {
-		end := i + batchSize
-		if end > len(allRequests) {
-			end = len(allRequests)
-		}
+		end := min(i+batchSize, len(allRequests))
 
 		batchRequests := allRequests[i:end]
-		compositeRequest := map[string]interface{}{
+		compositeRequest := map[string]any{
 			"allOrNone":        true,
 			"compositeRequest": batchRequests,
 		}
@@ -864,14 +739,14 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []DocumentInfo)
 		}
 		defer resp.Body.Close()
 
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		logger.Info("Received attachment uploader response: %s", string(body))
 
 		var compositeResponse struct {
 			CompositeResponse []struct {
-				Body           interface{} `json:"body"`
-				HttpStatusCode int         `json:"httpStatusCode"`
-				ReferenceId    string      `json:"referenceId"`
+				Body           any    `json:"body"`
+				HttpStatusCode int    `json:"httpStatusCode"`
+				ReferenceId    string `json:"referenceId"`
 			} `json:"compositeResponse"`
 		}
 
@@ -881,8 +756,8 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []DocumentInfo)
 
 		for _, result := range compositeResponse.CompositeResponse {
 			if result.HttpStatusCode != 201 {
-				if errArray, ok := result.Body.([]interface{}); ok && len(errArray) > 0 {
-					if errMap, ok := errArray[0].(map[string]interface{}); ok {
+				if errArray, ok := result.Body.([]any); ok && len(errArray) > 0 {
+					if errMap, ok := errArray[0].(map[string]any); ok {
 						return fmt.Errorf("failed to create Attachments_Uploader__c: %v - %v",
 							errMap["errorCode"], errMap["message"])
 					}
@@ -891,7 +766,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []DocumentInfo)
 					result.ReferenceId, result.HttpStatusCode)
 			}
 
-			if successBody, ok := result.Body.(map[string]interface{}); ok {
+			if successBody, ok := result.Body.(map[string]any); ok {
 				logger.Info("Created Attachments_Uploader__c with ID: %v", successBody["id"])
 			}
 		}
@@ -933,205 +808,9 @@ type BulkJobResponse struct {
 	ApiVersion     float64   `json:"apiVersion"`
 }
 
-func createBulkJob(accessToken string, jobData map[string]string) (string, error) {
-	logger := NewLogger()
-	jobBytes, _ := json.Marshal(jobData)
-
-	req, err := http.NewRequest("POST",
-		sfInstanceURL+"/services/data/v57.0/jobs/ingest",
-		bytes.NewBuffer(jobBytes))
-	if err != nil {
-		return "", fmt.Errorf("error creating bulk job request: %v", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("bulk job creation failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("error reading response body: %v", err)
-	}
-	logger.Info("Bulk job creation response: %s", string(body))
-
-	var jobResponse BulkJobResponse
-	if err := json.Unmarshal(body, &jobResponse); err != nil {
-		return "", fmt.Errorf("error decoding job response: %v", err)
-	}
-
-	if jobResponse.Id == "" {
-		return "", fmt.Errorf("no job ID in response: %s", string(body))
-	}
-
-	logger.Info("Created bulk job: %s", jobResponse.Id)
-	return jobResponse.Id, nil
-}
-
-func uploadBulkBatch(accessToken string, jobId string, records []map[string]interface{}) error {
-	logger := NewLogger()
-	recordsBytes, _ := json.Marshal(records)
-
-	req, err := http.NewRequest("PUT",
-		fmt.Sprintf("%s/services/data/v57.0/jobs/ingest/%s/batches", sfInstanceURL, jobId),
-		bytes.NewBuffer(recordsBytes))
-	if err != nil {
-		return fmt.Errorf("error creating batch request: %v", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("batch upload failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("batch upload failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	logger.Info("Uploaded batch to job %s", jobId)
-	return nil
-}
-
-func closeBulkJob(accessToken string, jobId string) error {
-	logger := NewLogger()
-	closeData := map[string]string{"state": "UploadComplete"}
-	closeBytes, _ := json.Marshal(closeData)
-
-	req, err := http.NewRequest("PATCH",
-		fmt.Sprintf("%s/services/data/v57.0/jobs/ingest/%s", sfInstanceURL, jobId),
-		bytes.NewBuffer(closeBytes))
-	if err != nil {
-		return fmt.Errorf("error creating job close request: %v", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("job close failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	logger.Info("Closed bulk job: %s", jobId)
-	return nil
-}
-
-func getBulkJobResults(accessToken string, jobId string) ([]struct{ Id string }, error) {
-	logger := NewLogger()
-
-	for {
-		req, err := http.NewRequest("GET",
-			fmt.Sprintf("%s/services/data/v57.0/jobs/ingest/%s", sfInstanceURL, jobId),
-			nil)
-		if err != nil {
-			return nil, fmt.Errorf("error creating status request: %v", err)
-		}
-
-		req.Header.Set("Authorization", "Bearer "+accessToken)
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("status check failed: %v", err)
-		}
-
-		var jobStatus struct {
-			State string `json:"state"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&jobStatus); err != nil {
-			resp.Body.Close()
-			return nil, fmt.Errorf("error decoding status: %v", err)
-		}
-		resp.Body.Close()
-
-		if jobStatus.State == "JobComplete" {
-			break
-		}
-		if jobStatus.State == "Failed" {
-			return nil, fmt.Errorf("job failed")
-		}
-
-		time.Sleep(5 * time.Second)
-	}
-
-	req, err := http.NewRequest("GET",
-		fmt.Sprintf("%s/services/data/v57.0/jobs/ingest/%s/successfulResults", sfInstanceURL, jobId),
-		nil)
-	if err != nil {
-		return nil, fmt.Errorf("error creating results request: %v", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("results request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var results []struct{ Id string }
-	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
-		return nil, fmt.Errorf("error decoding results: %v", err)
-	}
-
-	logger.Info("Retrieved %d successful results from job %s", len(results), jobId)
-	return results, nil
-}
-
-func queryContentDocumentIds(accessToken string, contentVersionIds []string) ([]string, error) {
-	logger := NewLogger()
-
-	idList := "'" + strings.Join(contentVersionIds, "','") + "'"
-	query := fmt.Sprintf("SELECT ContentDocumentId FROM ContentVersion WHERE Id IN (%s)", idList)
-
-	queryURL := fmt.Sprintf("%s/services/data/v57.0/query?q=%s",
-		sfInstanceURL,
-		url.QueryEscape(query))
-
-	req, err := http.NewRequest("GET", queryURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error creating query request: %v", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("query request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var queryResult struct {
-		Records []struct {
-			ContentDocumentId string `json:"ContentDocumentId"`
-		} `json:"records"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&queryResult); err != nil {
-		return nil, fmt.Errorf("error decoding query response: %v", err)
-	}
-
-	var contentDocIds []string
-	for _, record := range queryResult.Records {
-		contentDocIds = append(contentDocIds, record.ContentDocumentId)
-	}
-
-	logger.Info("Retrieved %d ContentDocumentIds", len(contentDocIds))
-	return contentDocIds, nil
-}
-
 func collectDocuments(documentsDir string) ([]DocumentInfo, error) {
 	logger := NewLogger()
-	files, err := ioutil.ReadDir(documentsDir)
+	files, err := os.ReadDir(documentsDir)
 	if err != nil {
 		return nil, fmt.Errorf("error reading documents directory: %v", err)
 	}
