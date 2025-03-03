@@ -14,13 +14,14 @@ import (
 	"strings"
 
 	"github.com/ORAITApps/document-uploader/internal/config"
-	"github.com/ORAITApps/document-uploader/internal/logger"
+	"github.com/ORAITApps/document-uploader/internal/gui"
 	"github.com/ORAITApps/document-uploader/internal/models"
 	"github.com/gabriel-vasile/mimetype"
 )
 
-func collectDocuments(documentsDir string) ([]models.DocumentInfo, error) {
-	logger := logger.New()
+func collectDocuments(documentsDir string, gui *gui.GUI) ([]models.DocumentInfo, error) {
+	gui.Log("Reading documents from directory: %s", documentsDir)
+
 	files, err := os.ReadDir(documentsDir)
 	if err != nil {
 		return nil, fmt.Errorf("error reading documents directory: %v", err)
@@ -32,7 +33,7 @@ func collectDocuments(documentsDir string) ([]models.DocumentInfo, error) {
 			continue
 		}
 
-		logger.Info("Reading file: %s", file.Name())
+		gui.Log("Reading file: %s", file.Name())
 
 		docInfo, err := ParseFileName(file.Name())
 		if err != nil {
@@ -42,32 +43,41 @@ func collectDocuments(documentsDir string) ([]models.DocumentInfo, error) {
 		documents = append(documents, *docInfo)
 	}
 
-	logger.Info("Collected %d documents for processing", len(documents))
+	gui.Log("Collected %d documents for processing", len(documents))
 	return documents, nil
 }
 
-func ProcessDocuments(accessToken, documentsDir string) error {
-	documents, err := collectDocuments(documentsDir)
+func ProcessDocuments(accessToken, documentsDir string, gui *gui.GUI) error {
+	gui.SetStatus("Collecting documents...")
+	documents, err := collectDocuments(documentsDir, gui)
 	if err != nil {
 		return fmt.Errorf("error collecting documents: %v", err)
 	}
+	gui.SetProgress(0.2)
 
-	if err := bulkLookupEntities(accessToken, documents); err != nil {
+	gui.SetStatus("Looking up entities...")
+	if err := bulkLookupEntities(accessToken, documents, gui); err != nil {
 		return fmt.Errorf("bulk lookup failed: %v", err)
 	}
+	gui.SetProgress(0.4)
 
-	if err := bulkUploadContentVersions(accessToken, documents); err != nil {
+	gui.SetStatus("Uploading content...")
+	if err := bulkUploadContentVersions(accessToken, documents, gui); err != nil {
 		return fmt.Errorf("bulk content upload failed: %v", err)
 	}
+	gui.SetProgress(0.8)
 
-	if err := bulkCreateAttachmentUploaders(accessToken, documents); err != nil {
+	gui.SetStatus("Creating attachment records...")
+	if err := bulkCreateAttachmentUploaders(accessToken, documents, gui); err != nil {
 		return fmt.Errorf("bulk attachment uploader creation failed: %v", err)
 	}
+	gui.SetProgress(1.0)
 
 	return nil
 }
 
-func bulkLookupEntities(accessToken string, documents []models.DocumentInfo) error {
+func bulkLookupEntities(accessToken string, documents []models.DocumentInfo, gui *gui.GUI) error {
+	gui.Log("Starting bulk entity lookup for %d documents", len(documents))
 
 	var bulkRequest models.BulkLookupRequest
 	for _, doc := range documents {
@@ -82,6 +92,7 @@ func bulkLookupEntities(accessToken string, documents []models.DocumentInfo) err
 		return fmt.Errorf("error marshaling bulk lookup request: %v", err)
 	}
 
+	gui.Log("Sending bulk lookup request to Salesforce")
 	req, err := http.NewRequest("POST", config.BulkLookupURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
@@ -101,6 +112,7 @@ func bulkLookupEntities(accessToken string, documents []models.DocumentInfo) err
 		return err
 	}
 
+	gui.Log("Processing lookup results")
 	for i := range documents {
 		found := false
 		for resultKey, resultId := range results {
@@ -112,31 +124,38 @@ func bulkLookupEntities(accessToken string, documents []models.DocumentInfo) err
 			if resultLookup.EntityType == documents[i].EntityType &&
 				compareNamePaths(resultLookup.NamePath, documents[i].NamePath) {
 				if strings.HasPrefix(resultId, "ERROR:") {
-					return fmt.Errorf("lookup failed for %s: %s", documents[i].FilePath, resultId)
+					errMsg := fmt.Sprintf("lookup failed for %s: %s", documents[i].FilePath, resultId)
+					gui.Log("Error: %s", errMsg)
+					return fmt.Errorf(errMsg)
 				}
 				documents[i].SalesforceIds[strings.ToLower(documents[i].EntityType)] = resultId
+				gui.Log("Found ID for %s: %s", documents[i].FilePath, resultId)
 				found = true
 				break
 			}
 		}
 
 		if !found {
-			return fmt.Errorf("no lookup result found for %s", documents[i].FilePath)
+			errMsg := fmt.Sprintf("no lookup result found for %s", documents[i].FilePath)
+			gui.Log("Error: %s", errMsg)
+			return fmt.Errorf(errMsg)
 		}
 	}
 
 	return nil
 }
 
-func bulkUploadContentVersions(accessToken string, documents []models.DocumentInfo) error {
-	logger := logger.New()
+func bulkUploadContentVersions(accessToken string, documents []models.DocumentInfo, gui *gui.GUI) error {
 	const batchSize = 25
 
 	var allRequests []map[string]any
+	gui.Log("Preparing content version upload requests")
 	for i, doc := range documents {
 		fileBytes, err := os.ReadFile(filepath.Join("./documents", doc.FilePath))
 		if err != nil {
-			return fmt.Errorf("error reading file %s: %v", doc.FilePath, err)
+			errMsg := fmt.Sprintf("error reading file %s: %v", doc.FilePath, err)
+			gui.Log("Error: %s", errMsg)
+			return fmt.Errorf(errMsg)
 		}
 
 		request := map[string]any{
@@ -151,19 +170,22 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 			},
 		}
 		allRequests = append(allRequests, request)
-		logger.Info("Prepared request for file: %s", doc.FilePath)
+		gui.Log("Prepared request for file: %s", doc.FilePath)
 	}
 
+	totalBatches := (len(allRequests) + batchSize - 1) / batchSize
+	currentBatch := 0
+
 	for i := 0; i < len(allRequests); i += batchSize {
+		currentBatch++
 		end := min(i+batchSize, len(allRequests))
+		gui.Log("Processing batch %d of %d (%d files)", currentBatch, totalBatches, end-i)
 
 		batchRequests := allRequests[i:end]
 		compositeRequest := map[string]any{
 			"allOrNone":        true,
 			"compositeRequest": batchRequests,
 		}
-
-		logger.Info("Sending ContentVersion request for %d files", len(batchRequests))
 
 		jsonBody, err := json.Marshal(compositeRequest)
 		if err != nil {
@@ -180,6 +202,7 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		req.Header.Set("Content-Type", "application/json")
 
+		gui.Log("Sending batch request to Salesforce")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("composite request failed: %v", err)
@@ -200,8 +223,10 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 
 		for _, result := range compositeResponse.CompositeResponse {
 			if result.HttpStatusCode != 201 {
-				return fmt.Errorf("failed to create ContentVersion for reference %s: status %d",
+				errMsg := fmt.Sprintf("failed to create ContentVersion for reference %s: status %d",
 					result.ReferenceId, result.HttpStatusCode)
+				gui.Log("Error: %s", errMsg)
+				return fmt.Errorf(errMsg)
 			}
 
 			if successBody, ok := result.Body.(map[string]any); ok {
@@ -209,13 +234,14 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 				if refIndex < len(documents) {
 					versionId := successBody["id"].(string)
 					documents[refIndex].SalesforceIds["contentVersionId"] = versionId
-					logger.Info("Created ContentVersion with ID: %s for file: %s",
+					gui.Log("Created ContentVersion with ID: %s for file: %s",
 						versionId, documents[refIndex].FilePath)
 				}
 			}
 		}
 	}
 
+	gui.Log("Retrieving ContentDocument IDs")
 	var versionIds []string
 	for _, doc := range documents {
 		if id, ok := doc.SalesforceIds["contentVersionId"]; ok {
@@ -226,8 +252,7 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 	if len(versionIds) > 0 {
 		soql := fmt.Sprintf(
 			"SELECT Id, ContentDocumentId FROM ContentVersion WHERE Id IN (%s)",
-			strings.Join(versionIds, ","),
-		)
+			strings.Join(versionIds, ","))
 
 		queryURL := fmt.Sprintf("%s/services/data/v57.0/query?q=%s",
 			config.SFInstanceURL,
@@ -260,29 +285,27 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 		cdIdMap := make(map[string]string)
 		for _, record := range queryResult.Records {
 			cdIdMap[record.Id] = record.ContentDocumentId
-			logger.Info("Mapping ContentVersion %s to ContentDocument %s",
+			gui.Log("Mapping ContentVersion %s to ContentDocument %s",
 				record.Id, record.ContentDocumentId)
 		}
-
-		logger.Info("ContentDocument mapping: %+v", cdIdMap)
 
 		for i := range documents {
 			if versionId, ok := documents[i].SalesforceIds["contentVersionId"]; ok {
 				if contentDocId, ok := cdIdMap[versionId]; ok {
 					documents[i].ContentDocumentId = contentDocId
-					logger.Info("Set ContentDocumentId %s for file %s (Version ID: %s)",
-						contentDocId, documents[i].FilePath, versionId)
+					gui.Log("Set ContentDocumentId %s for file %s",
+						contentDocId, documents[i].FilePath)
 				}
 			}
 		}
 	}
 
+	gui.Log("Verifying ContentDocument IDs")
 	for i := range documents {
-		logger.Info("Verifying document %s - ContentDocumentId: %s",
-			documents[i].FilePath, documents[i].ContentDocumentId)
 		if documents[i].ContentDocumentId == "" {
-			logger.Error("ContentDocumentId not set for file: %s (VersionId: %s)",
+			errMsg := fmt.Sprintf("ContentDocumentId not set for file: %s (VersionId: %s)",
 				documents[i].FilePath, documents[i].SalesforceIds["contentVersionId"])
+			gui.Log("Error: %s", errMsg)
 			return fmt.Errorf("failed to get ContentDocumentId for file: %s", documents[i].FilePath)
 		}
 	}
@@ -290,19 +313,20 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 	return nil
 }
 
-func bulkCreateAttachmentUploaders(accessToken string, documents []models.DocumentInfo) error {
-	logger := logger.New()
+func bulkCreateAttachmentUploaders(accessToken string, documents []models.DocumentInfo, gui *gui.GUI) error {
 	const batchSize = 25
+	gui.Log("Starting attachment uploader creation")
 
 	var allRequests []map[string]any
 	for i, doc := range documents {
-		logger.Info("Processing document: %s", doc.FilePath)
-		logger.Info("ContentDocumentId: %s", doc.ContentDocumentId)
-		logger.Info("EntityType: %s", doc.EntityType)
-		logger.Info("Available SalesforceIds: %+v", doc.SalesforceIds)
+		gui.Log("Processing document: %s", doc.FilePath)
+		gui.Log("ContentDocumentId: %s", doc.ContentDocumentId)
+		gui.Log("EntityType: %s", doc.EntityType)
+		gui.Log("Available SalesforceIds: %+v", doc.SalesforceIds)
 
 		if doc.ContentDocumentId == "" {
-			logger.Error("Missing ContentDocumentId for document: %s", doc.FilePath)
+			errMsg := fmt.Sprintf("Missing ContentDocumentId for document: %s", doc.FilePath)
+			gui.Log("Error: %s", errMsg)
 			continue
 		}
 
@@ -321,7 +345,8 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 		}
 
 		if entityId == "" {
-			logger.Error("Missing %s ID for document: %s", doc.EntityType, doc.FilePath)
+			errMsg := fmt.Sprintf("Missing %s ID for document: %s", doc.EntityType, doc.FilePath)
+			gui.Log("Error: %s", errMsg)
 			continue
 		}
 
@@ -350,7 +375,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 			record["Design_Type__c"] = entityId
 		}
 
-		logger.Info("Creating attachment uploader record: %+v", record)
+		gui.Log("Creating attachment uploader record for: %s", doc.FilePath)
 
 		request := map[string]any{
 			"method":      "POST",
@@ -365,8 +390,13 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 		return fmt.Errorf("no valid records to create")
 	}
 
+	totalBatches := (len(allRequests) + batchSize - 1) / batchSize
+	currentBatch := 0
+
 	for i := 0; i < len(allRequests); i += batchSize {
+		currentBatch++
 		end := min(i+batchSize, len(allRequests))
+		gui.Log("Processing batch %d of %d (%d records)", currentBatch, totalBatches, end-i)
 
 		batchRequests := allRequests[i:end]
 		compositeRequest := map[string]any{
@@ -375,7 +405,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 		}
 
 		jsonBody, _ := json.Marshal(compositeRequest)
-		logger.Info("Sending attachment uploader request: %s", string(jsonBody))
+		gui.Log("Sending attachment uploader request")
 
 		req, err := http.NewRequest("POST",
 			config.SFInstanceURL+"/services/data/v57.0/composite",
@@ -394,7 +424,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 		defer resp.Body.Close()
 
 		body, _ := io.ReadAll(resp.Body)
-		logger.Info("Received attachment uploader response: %s", string(body))
+		gui.Log("Received attachment uploader response: %s", string(body))
 
 		var compositeResponse struct {
 			CompositeResponse []struct {
@@ -412,21 +442,25 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 			if result.HttpStatusCode != 201 {
 				if errArray, ok := result.Body.([]any); ok && len(errArray) > 0 {
 					if errMap, ok := errArray[0].(map[string]any); ok {
-						return fmt.Errorf("failed to create Attachments_Uploader__c: %v - %v",
+						errMsg := fmt.Sprintf("failed to create Attachments_Uploader__c: %v - %v",
 							errMap["errorCode"], errMap["message"])
+						gui.Log("Error: %s", errMsg)
+						return fmt.Errorf(errMsg)
 					}
 				}
-				return fmt.Errorf("failed to create Attachments_Uploader__c for reference %s: status %d",
+				errMsg := fmt.Sprintf("failed to create Attachments_Uploader__c for reference %s: status %d",
 					result.ReferenceId, result.HttpStatusCode)
+				gui.Log("Error: %s", errMsg)
+				return fmt.Errorf(errMsg)
 			}
 
 			if successBody, ok := result.Body.(map[string]any); ok {
-				logger.Info("Created Attachments_Uploader__c with ID: %v", successBody["id"])
+				gui.Log("Created Attachments_Uploader__c with ID: %v", successBody["id"])
 			}
 		}
 	}
 
-	logger.Info("Successfully created %d attachment uploaders", len(allRequests))
+	gui.Log("Successfully created all attachment uploaders")
 	return nil
 }
 

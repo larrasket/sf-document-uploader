@@ -5,7 +5,7 @@ import (
 
 	"github.com/ORAITApps/document-uploader/internal/auth"
 	"github.com/ORAITApps/document-uploader/internal/config"
-	"github.com/ORAITApps/document-uploader/internal/logger"
+	"github.com/ORAITApps/document-uploader/internal/gui"
 	"github.com/ORAITApps/document-uploader/internal/processor"
 )
 
@@ -15,21 +15,41 @@ var env embed.FS
 func main() {
 	config.LoadEnv(env)
 
-	logger := logger.New()
-	logger.Info("Starting document processing...")
-
-	tokenResp, err := auth.Authenticate()
+	gui, err := gui.New()
 	if err != nil {
-		logger.Error("Authentication failed: %v", err)
-		return
+		panic(err)
 	}
-	logger.Info("Successfully authenticated")
+	defer gui.Close()
 
-	err = processor.ProcessDocuments(tokenResp.AccessToken, "./documents")
-	if err != nil {
-		logger.Error("Document processing failed: %v", err)
-		return
-	}
+	go func() {
+		gui.Log("Starting document processing...")
+		gui.SetStatus("Authenticating...")
+		gui.SetProgress(0.1)
 
-	logger.Info("Document processing completed successfully")
+		tokenResp, err := auth.Authenticate()
+		if err != nil {
+			gui.Log("Authentication failed: %v", err)
+			gui.ShowError("Authentication Error", err.Error())
+			gui.Quit()
+			return
+		}
+		gui.Log("Successfully authenticated")
+		gui.SetProgress(0.3)
+
+		gui.SetStatus("Processing documents...")
+		err = processor.ProcessDocuments(tokenResp.AccessToken, "./documents", gui)
+		if err != nil {
+			gui.Log("Document processing failed: %v", err)
+			gui.ShowError("Processing Error", err.Error())
+			gui.Quit()
+			return
+		}
+
+		gui.SetProgress(1.0)
+		gui.SetStatus("Completed")
+		gui.Log("Document processing completed successfully")
+	}()
+
+	gui.Show()
+
 }
