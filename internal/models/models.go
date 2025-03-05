@@ -16,6 +16,7 @@ type EntityLookup struct {
 
 type DocumentInfo struct {
 	FilePath          string
+	RelativePath      string // Add this field
 	EntityType        string
 	NamePath          map[string]string
 	DocumentType      string

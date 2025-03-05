@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/ORAITApps/document-uploader/internal/config"
+	"github.com/ORAITApps/document-uploader/internal/filestructure"
 	"github.com/ORAITApps/document-uploader/internal/gui"
 	"github.com/ORAITApps/document-uploader/internal/models"
 	"github.com/gabriel-vasile/mimetype"
@@ -22,25 +23,10 @@ import (
 func collectDocuments(documentsDir string, gui *gui.GUI) ([]models.DocumentInfo, error) {
 	gui.Log("Reading documents from directory: %s", documentsDir)
 
-	files, err := os.ReadDir(documentsDir)
+	walker := filestructure.NewDocumentWalker(documentsDir)
+	documents, err := walker.Walk()
 	if err != nil {
-		return nil, fmt.Errorf("error reading documents directory: %v", err)
-	}
-
-	var documents []models.DocumentInfo
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-
-		gui.Log("Reading file: %s", file.Name())
-
-		docInfo, err := ParseFileName(file.Name())
-		if err != nil {
-			return nil, fmt.Errorf("error parsing filename %s: %v", file.Name(), err)
-		}
-
-		documents = append(documents, *docInfo)
+		return nil, fmt.Errorf("error walking documents directory: %v", err)
 	}
 
 	gui.Log("Collected %d documents for processing", len(documents))
@@ -151,9 +137,12 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 	var allRequests []map[string]any
 	gui.Log("Preparing content version upload requests")
 	for i, doc := range documents {
-		fileBytes, err := os.ReadFile(filepath.Join("./documents", doc.FilePath))
+		// Construct the full path using the relative path components
+		fullPath := filepath.Join("./documents", filepath.Dir(doc.RelativePath), doc.FilePath)
+
+		fileBytes, err := os.ReadFile(fullPath)
 		if err != nil {
-			errMsg := fmt.Sprintf("error reading file %s: %v", doc.FilePath, err)
+			errMsg := fmt.Sprintf("error reading file %s: %v", fullPath, err)
 			gui.Log("Error: %s", errMsg)
 			return fmt.Errorf(errMsg)
 		}
@@ -170,7 +159,7 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 			},
 		}
 		allRequests = append(allRequests, request)
-		gui.Log("Prepared request for file: %s", doc.FilePath)
+		gui.Log("Prepared request for file: %s", fullPath)
 	}
 
 	totalBatches := (len(allRequests) + batchSize - 1) / batchSize
