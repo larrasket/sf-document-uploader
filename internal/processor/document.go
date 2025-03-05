@@ -88,7 +88,6 @@ func ProcessDocuments(accessToken, documentsDir string, app *gui.App) error {
 func collectDocuments(documentsDir string, logger *logging.Logger) ([]models.DocumentInfo, error) {
 	logger.Info("Reading documents from directory: %s", documentsDir)
 
-	// Validate directory exists
 	if _, err := os.Stat(documentsDir); os.IsNotExist(err) {
 		logger.Error("Directory not found: %s", documentsDir)
 		return nil, fmt.Errorf("directory not found: %s", documentsDir)
@@ -288,8 +287,7 @@ func getParentKey(entityType string, namePath map[string]string) string {
 }
 
 func bulkUploadContentVersions(accessToken string, documents []models.DocumentInfo, logger *logging.Logger, app *gui.App) error {
-	// TODO Change
-	const batchSize = 1
+	const batchSize = 25
 
 	var allRequests []map[string]any
 	logger.Info("Preparing content version upload requests")
@@ -472,6 +470,12 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 	}
 
 	logger.Info("Successfully completed content version uploads")
+
+	if err := createContentDistributions(accessToken, documents, logger); err != nil {
+		logger.Error("Failed to create content distributions: %v", err)
+		return fmt.Errorf("failed to create content distributions: %v", err)
+	}
+
 	return nil
 }
 
@@ -514,12 +518,18 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 
 		displayValue := generateDisplayValue(doc)
 
+		distributionUrl := doc.SalesforceIds["distributionUrl"]
+		if distributionUrl == "" {
+			logger.Warning("No distribution URL found for document: %s", doc.FilePath)
+			distributionUrl = fmt.Sprintf("/lightning/r/ContentDocument/%s/view", doc.ContentDocumentId)
+		}
+
 		record := map[string]any{
 			"Name":                    entityId,
 			"Attachment_Type__c":      doc.DocumentType,
 			"Content_Type__c":         getContentType(doc.FilePath),
 			"ContentDocumentId__c":    doc.ContentDocumentId,
-			"Attachment_Url__c":       fmt.Sprintf("/lightning/r/ContentDocument/%s/view", doc.ContentDocumentId),
+			"Attachment_Url__c":       distributionUrl,
 			"Display_Value__c":        displayValue,
 			"Display_Value_Arabic__c": displayValue,
 		}
@@ -745,4 +755,127 @@ func generateFullPath(doc models.DocumentInfo) string {
 	default:
 		return doc.FilePath
 	}
+}
+
+func createContentDistributions(accessToken string, documents []models.DocumentInfo, logger *logging.Logger) error {
+	logger.Info("Creating content distributions")
+
+	var requests []map[string]any
+	for i, doc := range documents {
+		if doc.ContentDocumentId == "" {
+			continue
+		}
+
+		request := map[string]any{
+			"method":      "POST",
+			"url":         "/services/data/v57.0/sobjects/ContentDistribution",
+			"referenceId": fmt.Sprintf("distRef%d", i),
+			"body": map[string]any{
+				"ContentVersionId":                 doc.SalesforceIds["contentVersionId"],
+				"Name":                             filepath.Base(doc.FilePath),
+				"PreferencesAllowViewInBrowser":    true,
+				"PreferencesLinkLatestVersion":     true,
+				"PreferencesNotifyOnVisit":         false,
+				"PreferencesPasswordRequired":      false,
+				"PreferencesAllowOriginalDownload": true,
+			},
+		}
+		requests = append(requests, request)
+	}
+
+	if len(requests) == 0 {
+		return fmt.Errorf("no documents to create distributions for")
+	}
+
+	compositeRequest := map[string]any{
+		"allOrNone":        true,
+		"compositeRequest": requests,
+	}
+
+	jsonBody, _ := json.Marshal(compositeRequest)
+	logger.Debug("Content distribution request: %s", string(jsonBody))
+
+	req, err := http.NewRequest("POST",
+		config.SFInstanceURL+"/services/data/v57.0/composite",
+		bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return fmt.Errorf("error creating distribution request: %v", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("distribution request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	logger.Debug("Content distribution response: %s", string(respBody))
+
+	var result struct {
+		CompositeResponse []struct {
+			Body struct {
+				Id                    string `json:"id"`
+				ContentDistributionId string `json:"contentDistributionId"`
+			} `json:"body"`
+			HttpStatusCode int    `json:"httpStatusCode"`
+			ReferenceId    string `json:"referenceId"`
+		} `json:"compositeResponse"`
+	}
+
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return fmt.Errorf("error decoding distribution response: %v", err)
+	}
+
+	for _, response := range result.CompositeResponse {
+		if response.HttpStatusCode != 201 {
+			continue
+		}
+
+		distributionUrl := fmt.Sprintf("%s/services/data/v57.0/sobjects/ContentDistribution/%s",
+			config.SFInstanceURL, response.Body.Id)
+
+		req, err := http.NewRequest("GET", distributionUrl, nil)
+		if err != nil {
+			logger.Error("Failed to create distribution details request: %v", err)
+			continue
+		}
+
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+
+		detailsResp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			logger.Error("Failed to get distribution details: %v", err)
+			continue
+		}
+		defer detailsResp.Body.Close()
+
+		var distributionDetails struct {
+			DistributionPublicUrl string `json:"DistributionPublicUrl"`
+			ContentDownloadUrl    string `json:"ContentDownloadUrl"`
+		}
+
+		if err := json.NewDecoder(detailsResp.Body).Decode(&distributionDetails); err != nil {
+			logger.Error("Failed to decode distribution details: %v", err)
+			continue
+		}
+
+		refIndex, _ := strconv.Atoi(strings.TrimPrefix(response.ReferenceId, "distRef"))
+		if refIndex < len(documents) {
+			documents[refIndex].SalesforceIds["distributionUrl"] = distributionDetails.ContentDownloadUrl
+			logger.Debug("Set distribution URL for %s: %s",
+				documents[refIndex].FilePath,
+				distributionDetails.ContentDownloadUrl)
+		}
+	}
+
+	for _, doc := range documents {
+		if doc.SalesforceIds["distributionUrl"] == "" {
+			logger.Warning("Document %s does not have a distribution URL", doc.FilePath)
+		}
+	}
+
+	return nil
 }
