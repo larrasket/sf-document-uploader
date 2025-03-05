@@ -31,7 +31,7 @@ func NewApp() *App {
 	a := app.NewWithID("com.orait.document-uploader")
 	w := a.NewWindow("Document Uploader")
 
-	return &App{
+	app := &App{
 		fyneApp:   a,
 		window:    w,
 		logView:   widget.NewTextGrid(),
@@ -39,9 +39,20 @@ func NewApp() *App {
 		status:    widget.NewLabel("Select documents directory to begin"),
 		pathLabel: widget.NewLabel("No directory selected"),
 	}
+
+	logger := logging.GetLogger()
+	logger.SetGuiLogView(app.logView)
+
+	return app
+}
+
+func (a *App) AddLog(message string) {
+	logger := logging.GetLogger()
+	logger.Info(message)
 }
 
 func (a *App) Run() {
+
 	selectBtn := widget.NewButton("Select Directory", a.handleDirectorySelection)
 	a.startBtn = widget.NewButton("Start Processing", a.handleStartProcessing)
 	a.startBtn.Disable()
@@ -73,14 +84,6 @@ func (a *App) Run() {
 	a.window.ShowAndRun()
 }
 
-func (a *App) AddLog(message string) {
-	currentText := a.logView.Text()
-	if currentText != "" {
-		currentText += "\n"
-	}
-	a.logView.SetText(currentText + message)
-}
-
 func (a *App) SetStatus(status string) {
 	a.status.SetText(status)
 }
@@ -110,16 +113,20 @@ func (a *App) Reset() {
 }
 
 func (a *App) handleStartProcessing() {
+	logger := logging.GetLogger()
+
 	if a.processStarted {
 		return
 	}
 
 	if a.documentsPath == "" {
+		logger.Error("No directory selected")
 		a.ShowError("Error", "Please select a documents directory first")
 		return
 	}
 
 	if _, err := os.Stat(a.documentsPath); os.IsNotExist(err) {
+		logger.Error("Selected directory no longer exists: %s", a.documentsPath)
 		a.ShowError("Error", fmt.Sprintf("Selected directory no longer exists: %s", a.documentsPath))
 		a.documentsPath = ""
 		a.pathLabel.SetText("No directory selected")
@@ -130,7 +137,7 @@ func (a *App) handleStartProcessing() {
 	a.processStarted = true
 	a.startBtn.Disable()
 	a.progress.SetValue(0)
-	a.SetStatus("Starting process...")
+	logger.Info("🚀 Starting processing...")
 
 	if a.processingHandler != nil {
 		go a.processingHandler()
@@ -140,12 +147,16 @@ func (a *App) handleStartProcessing() {
 func (a *App) handleDirectorySelection() {
 	cwd, err := os.Getwd()
 	if err != nil {
+		logger := logging.GetLogger()
+		logger.Error("Failed to get current directory: %v", err)
 		a.ShowError("Error", "Failed to get current directory: "+err.Error())
 		return
 	}
 
 	folderDialog := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
+		logger := logging.GetLogger()
 		if err != nil {
+			logger.Error("Directory selection failed: %v", err)
 			a.ShowError("Directory Selection Error", err.Error())
 			return
 		}
@@ -157,14 +168,14 @@ func (a *App) handleDirectorySelection() {
 
 		path := uri.Path()
 		if _, err := os.Stat(path); os.IsNotExist(err) {
+			logger.Error("Selected directory does not exist: %s", path)
 			a.ShowError("Error", "Selected directory does not exist")
 			return
 		}
 
 		a.documentsPath = path
 		a.pathLabel.SetText(filepath.Base(path))
-		logger := logging.GetLogger()
-		logger.Success("Selected directory: " + path)
+		logger.Success("📁 Selected directory: %s", path)
 		a.startBtn.Enable()
 	}, a.window)
 

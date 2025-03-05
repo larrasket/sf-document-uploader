@@ -6,6 +6,7 @@ import (
 	"github.com/ORAITApps/document-uploader/internal/auth"
 	"github.com/ORAITApps/document-uploader/internal/config"
 	"github.com/ORAITApps/document-uploader/internal/gui"
+	logging "github.com/ORAITApps/document-uploader/internal/logger"
 	"github.com/ORAITApps/document-uploader/internal/processor"
 )
 
@@ -16,31 +17,34 @@ func main() {
 	config.LoadEnv(env)
 	app := gui.NewApp()
 
-	// Add processing functionality
+	logger := logging.GetLogger()
+	defer logger.Close()
+
 	app.SetProcessingHandler(func() {
+		logger.Info("Starting authentication process...")
 		app.SetStatus("Authenticating...")
 		app.SetProgress(0.1)
 
 		tokenResp, err := auth.Authenticate()
 		if err != nil {
-			app.AddLog("Authentication failed: " + err.Error())
+			logger.Error("Authentication failed: %v", err)
 			app.ShowError("Authentication Error", err.Error())
 			app.Reset()
 			return
 		}
 
-		app.AddLog("Authentication successful")
+		logger.Success("✅ Authentication successful")
 
 		if err := processor.ProcessDocuments(tokenResp.AccessToken, app.GetDocumentsPath(), app); err != nil {
-			app.AddLog("Processing failed: " + err.Error())
+			logger.Error("Processing failed: %v", err)
 			app.ShowError("Processing Error", err.Error())
 			app.Reset()
 			return
 		}
 
+		logger.Success("🎉 Processing completed successfully!")
 		app.SetProgress(1.0)
 		app.SetStatus("Completed")
-		app.AddLog("Processing completed successfully")
 	})
 
 	app.Run()
