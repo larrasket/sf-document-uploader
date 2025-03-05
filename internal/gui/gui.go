@@ -3,108 +3,188 @@ package gui
 import (
 	"fmt"
 	"os"
-	"sync"
-	"time"
+	"path/filepath"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
+	logging "github.com/ORAITApps/document-uploader/internal/logger"
 )
 
-type GUI struct {
-	window      fyne.Window
-	logView     *widget.TextGrid
-	progress    *widget.ProgressBar
-	statusLabel *widget.Label
-	logFile     *os.File
-	mutex       sync.Mutex
-	app         fyne.App
+type App struct {
+	fyneApp           fyne.App
+	window            fyne.Window
+	logView           *widget.TextGrid
+	progress          *widget.ProgressBar
+	status            *widget.Label
+	pathLabel         *widget.Label
+	startBtn          *widget.Button
+	documentsPath     string
+	processStarted    bool
+	processingHandler func()
 }
 
-func New() (*GUI, error) {
-	application := app.New()
-	window := application.NewWindow("Document Uploader")
+func NewApp() *App {
+	a := app.NewWithID("com.orait.document-uploader")
+	w := a.NewWindow("Document Uploader")
 
-	logFile, err := os.OpenFile(
-		fmt.Sprintf("upload_log_%s.txt", time.Now().Format("2006-01-02_15-04-05")),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0666,
+	return &App{
+		fyneApp:   a,
+		window:    w,
+		logView:   widget.NewTextGrid(),
+		progress:  widget.NewProgressBar(),
+		status:    widget.NewLabel("Select documents directory to begin"),
+		pathLabel: widget.NewLabel("No directory selected"),
+	}
+}
+
+func (a *App) Run() {
+	selectBtn := widget.NewButton("Select Directory", a.handleDirectorySelection)
+	a.startBtn = widget.NewButton("Start Processing", a.handleStartProcessing)
+	a.startBtn.Disable()
+
+	buttons := container.NewHBox(selectBtn, a.startBtn)
+
+	pathInfo := container.NewHBox(
+		widget.NewLabel("Selected Directory:"),
+		a.pathLabel,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create log file: %v", err)
-	}
 
-	gui := &GUI{
-		window:  window,
-		logFile: logFile,
-		app:     application,
-	}
+	progressSection := container.NewVBox(
+		a.status,
+		a.progress,
+	)
 
-	gui.setupUI()
-	return gui, nil
-}
-
-func (g *GUI) setupUI() {
-	g.logView = widget.NewTextGrid()
-	g.logView.SetText("")
-	g.progress = widget.NewProgressBar()
-	g.statusLabel = widget.NewLabel("Ready")
-
-	scrollContainer := container.NewScroll(g.logView)
-	scrollContainer.SetMinSize(fyne.NewSize(600, 300))
+	logScroll := container.NewScroll(a.logView)
+	logScroll.SetMinSize(fyne.NewSize(600, 300))
 
 	content := container.NewVBox(
-		widget.NewLabel("Document Upload Progress"),
-		g.progress,
-		g.statusLabel,
-		scrollContainer,
+		buttons,
+		pathInfo,
+		progressSection,
+		logScroll,
 	)
 
-	g.window.SetContent(content)
-	g.window.Resize(fyne.NewSize(700, 400))
+	a.window.SetContent(content)
+	a.window.Resize(fyne.NewSize(700, 500))
+	a.window.ShowAndRun()
 }
 
-func (g *GUI) Show() {
-	g.window.ShowAndRun()
+func (a *App) AddLog(message string) {
+	currentText := a.logView.Text()
+	if currentText != "" {
+		currentText += "\n"
+	}
+	a.logView.SetText(currentText + message)
 }
 
-func (g *GUI) Log(format string, v ...interface{}) {
-	g.mutex.Lock()
-	defer g.mutex.Unlock()
-
-	message := fmt.Sprintf("[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, v...))
-
-	// Update GUI
-	currentText := g.logView.Text()
-	g.logView.SetText(currentText + message)
-
-	// Write to log file
-	g.logFile.WriteString(message)
-
-	// Auto-scroll to bottom
-	g.logView.Refresh()
+func (a *App) SetStatus(status string) {
+	a.status.SetText(status)
 }
 
-func (g *GUI) SetProgress(value float64) {
-	g.progress.SetValue(value)
+func (a *App) SetProgress(value float64) {
+	a.progress.SetValue(value)
 }
 
-func (g *GUI) SetStatus(status string) {
-	g.statusLabel.SetText(status)
+func (a *App) GetLogView() *widget.TextGrid {
+	return a.logView
 }
 
-func (g *GUI) ShowError(title, message string) {
-	dialog.ShowError(fmt.Errorf(message), g.window)
+func (a *App) ShowError(title, message string) {
+	dialog.ShowError(fmt.Errorf(message), a.window)
 }
 
-func (g *GUI) Close() {
-	if g.logFile != nil {
-		g.logFile.Close()
+func (a *App) SetProcessingHandler(handler func()) {
+	a.processingHandler = handler
+}
+
+func (a *App) Reset() {
+	a.processStarted = false
+	a.progress.SetValue(0)
+	a.SetStatus("Ready to start")
+	a.startBtn.Enable()
+	a.logView.SetText("")
+}
+
+func (a *App) handleStartProcessing() {
+	if a.processStarted {
+		return
+	}
+
+	if a.documentsPath == "" {
+		a.ShowError("Error", "Please select a documents directory first")
+		return
+	}
+
+	if _, err := os.Stat(a.documentsPath); os.IsNotExist(err) {
+		a.ShowError("Error", fmt.Sprintf("Selected directory no longer exists: %s", a.documentsPath))
+		a.documentsPath = ""
+		a.pathLabel.SetText("No directory selected")
+		a.startBtn.Disable()
+		return
+	}
+
+	a.processStarted = true
+	a.startBtn.Disable()
+	a.progress.SetValue(0)
+	a.SetStatus("Starting process...")
+
+	if a.processingHandler != nil {
+		go a.processingHandler()
 	}
 }
 
-func (g *GUI) Quit() {
-	g.app.Quit()
+func (a *App) handleDirectorySelection() {
+	cwd, err := os.Getwd()
+	if err != nil {
+		a.ShowError("Error", "Failed to get current directory: "+err.Error())
+		return
+	}
+
+	folderDialog := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
+		if err != nil {
+			a.ShowError("Directory Selection Error", err.Error())
+			return
+		}
+		if uri == nil {
+			return
+		}
+
+		a.Reset()
+
+		path := uri.Path()
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			a.ShowError("Error", "Selected directory does not exist")
+			return
+		}
+
+		a.documentsPath = path
+		a.pathLabel.SetText(filepath.Base(path))
+		logger := logging.GetLogger()
+		logger.Success("Selected directory: " + path)
+		a.startBtn.Enable()
+	}, a.window)
+
+	startURI, err := storage.ParseURI("file://" + cwd)
+	if err == nil {
+		listURI, err := storage.ListerForURI(startURI)
+		if err == nil && listURI != nil {
+			folderDialog.SetLocation(listURI)
+		}
+	}
+
+	folderDialog.Show()
+}
+
+func (a *App) GetDocumentsPath() string {
+	if a.documentsPath == "" {
+		return ""
+	}
+	if _, err := os.Stat(a.documentsPath); os.IsNotExist(err) {
+		return ""
+	}
+	return a.documentsPath
 }

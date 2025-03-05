@@ -16,72 +16,114 @@ import (
 	"github.com/ORAITApps/document-uploader/internal/config"
 	"github.com/ORAITApps/document-uploader/internal/filestructure"
 	"github.com/ORAITApps/document-uploader/internal/gui"
+	logging "github.com/ORAITApps/document-uploader/internal/logger"
 	"github.com/ORAITApps/document-uploader/internal/models"
 	"github.com/gabriel-vasile/mimetype"
 )
 
-func collectDocuments(documentsDir string, gui *gui.GUI) ([]models.DocumentInfo, error) {
-	gui.Log("Reading documents from directory: %s", documentsDir)
+type LookupError struct {
+	EntityType string
+	Path       string
+	Details    string
+}
+
+type EntityHierarchy struct {
+	Type    string
+	Parent  string
+	IDKey   string
+	NameKey string
+}
+
+var hierarchyDefinition = []EntityHierarchy{
+	{Type: "PROJECT", Parent: "", IDKey: "project", NameKey: "project"},
+	{Type: "PHASE", Parent: "PROJECT", IDKey: "phase", NameKey: "phase"},
+	{Type: "ZONE", Parent: "PHASE", IDKey: "zone", NameKey: "zone"},
+	{Type: "BUILDING", Parent: "ZONE", IDKey: "building", NameKey: "building"},
+	{Type: "UNIT", Parent: "BUILDING", IDKey: "unit", NameKey: "unit"},
+	{Type: "DESIGN_TYPE", Parent: "PHASE", IDKey: "design_type", NameKey: "designType"},
+}
+
+func ProcessDocuments(accessToken, documentsDir string, app *gui.App) error {
+	logger := logging.GetLogger()
+
+	if documentsDir == "" {
+		return fmt.Errorf("no documents directory selected")
+	}
+
+	if _, err := os.Stat(documentsDir); os.IsNotExist(err) {
+		return fmt.Errorf("documents directory does not exist: %s", documentsDir)
+	}
+
+	app.SetStatus("Collecting documents...")
+	documents, err := collectDocuments(documentsDir, logger)
+	if err != nil {
+		return fmt.Errorf("error collecting documents: %v", err)
+	}
+	app.SetProgress(0.2)
+
+	app.SetStatus("Looking up entities...")
+	if err := bulkLookupEntities(accessToken, documents, logger); err != nil {
+		return fmt.Errorf("bulk lookup failed: %v", err)
+	}
+	app.SetProgress(0.4)
+
+	app.SetStatus("Uploading content...")
+	if err := bulkUploadContentVersions(accessToken, documents, logger, app); err != nil {
+		logger.Error("Bulk content upload failed: %v", err)
+		return fmt.Errorf("bulk content upload failed: %v", err)
+	}
+	app.SetProgress(0.8)
+
+	app.SetStatus("Creating attachment records...")
+	if err := bulkCreateAttachmentUploaders(accessToken, documents, logger); err != nil {
+		logger.Error("Bulk attachment uploader creation failed: %v", err)
+		return fmt.Errorf("bulk attachment uploader creation failed: %v", err)
+	}
+	app.SetProgress(1.0)
+
+	logger.Info("Document processing completed successfully")
+	return nil
+}
+
+func collectDocuments(documentsDir string, logger *logging.Logger) ([]models.DocumentInfo, error) {
+	logger.Info("Reading documents from directory: %s", documentsDir)
+
+	// Validate directory exists
+	if _, err := os.Stat(documentsDir); os.IsNotExist(err) {
+		logger.Error("Directory not found: %s", documentsDir)
+		return nil, fmt.Errorf("directory not found: %s", documentsDir)
+	}
 
 	walker := filestructure.NewDocumentWalker(documentsDir)
 	documents, err := walker.Walk()
 	if err != nil {
+		logger.Error("Failed to walk documents directory: %v", err)
 		return nil, fmt.Errorf("error walking documents directory: %v", err)
 	}
 
-	gui.Log("Collected %d documents for processing", len(documents))
+	if len(documents) == 0 {
+		logger.Warning("No documents found in directory")
+		return nil, fmt.Errorf("no documents found in directory: %s", documentsDir)
+	}
+
+	logger.Info("Collected %d documents for processing", len(documents))
 	return documents, nil
 }
 
-func ProcessDocuments(accessToken, documentsDir string, gui *gui.GUI) error {
-	gui.SetStatus("Collecting documents...")
-	documents, err := collectDocuments(documentsDir, gui)
-	if err != nil {
-		return fmt.Errorf("error collecting documents: %v", err)
-	}
-	gui.SetProgress(0.2)
-
-	gui.SetStatus("Looking up entities...")
-	if err := bulkLookupEntities(accessToken, documents, gui); err != nil {
-		return fmt.Errorf("bulk lookup failed: %v", err)
-	}
-	gui.SetProgress(0.4)
-
-	gui.SetStatus("Uploading content...")
-	if err := bulkUploadContentVersions(accessToken, documents, gui); err != nil {
-		return fmt.Errorf("bulk content upload failed: %v", err)
-	}
-	gui.SetProgress(0.8)
-
-	gui.SetStatus("Creating attachment records...")
-	if err := bulkCreateAttachmentUploaders(accessToken, documents, gui); err != nil {
-		return fmt.Errorf("bulk attachment uploader creation failed: %v", err)
-	}
-	gui.SetProgress(1.0)
-
-	return nil
-}
-
-func bulkLookupEntities(accessToken string, documents []models.DocumentInfo, gui *gui.GUI) error {
-	gui.Log("Starting bulk entity lookup for %d documents", len(documents))
-
-	var bulkRequest models.BulkLookupRequest
-	for _, doc := range documents {
-		bulkRequest.Lookups = append(bulkRequest.Lookups, models.EntityLookup{
-			EntityType: doc.EntityType,
-			NamePath:   doc.NamePath,
-		})
-	}
-
+func executeBulkLookup(accessToken string, bulkRequest models.BulkLookupRequest, logger *logging.Logger) (map[string]string, error) {
 	jsonData, err := json.Marshal(bulkRequest)
 	if err != nil {
-		return fmt.Errorf("error marshaling bulk lookup request: %v", err)
+		logger.Error("Failed to marshal bulk lookup request: %v", err)
+		return nil, fmt.Errorf("error marshaling bulk lookup request: %v", err)
 	}
 
-	gui.Log("Sending bulk lookup request to Salesforce")
+	logger.Debug("Bulk lookup request payload: %s", string(jsonData))
+
+	logger.Debug("Sending bulk lookup request to Salesforce")
 	req, err := http.NewRequest("POST", config.BulkLookupURL, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return err
+		logger.Error("Failed to create bulk lookup request: %v", err)
+		return nil, err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -89,61 +131,182 @@ func bulkLookupEntities(accessToken string, documents []models.DocumentInfo, gui
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		logger.Error("Failed to execute bulk lookup request: %v", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+	logger.Debug("Bulk lookup response: %s", string(respBody))
+
 	var results map[string]string
-	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
-		return err
+	if err := json.Unmarshal(respBody, &results); err != nil {
+		logger.Error("Failed to decode bulk lookup response: %v", err)
+		return nil, err
 	}
 
-	gui.Log("Processing lookup results")
-	for i := range documents {
-		found := false
-		for resultKey, resultId := range results {
-			var resultLookup models.EntityLookup
-			if err := json.Unmarshal([]byte(resultKey), &resultLookup); err != nil {
-				continue
-			}
+	return results, nil
+}
 
-			if resultLookup.EntityType == documents[i].EntityType &&
-				compareNamePaths(resultLookup.NamePath, documents[i].NamePath) {
-				if strings.HasPrefix(resultId, "ERROR:") {
-					errMsg := fmt.Sprintf("lookup failed for %s: %s", documents[i].FilePath, resultId)
-					gui.Log("Error: %s", errMsg)
-					return fmt.Errorf(errMsg)
+func bulkLookupEntities(accessToken string, documents []models.DocumentInfo, logger *logging.Logger) error {
+	logger.Info("Starting bulk entity lookup for %d documents", len(documents))
+
+	entityLevels := make(map[string][]models.DocumentInfo)
+	for _, doc := range documents {
+		entityLevels[doc.EntityType] = append(entityLevels[doc.EntityType], doc)
+	}
+
+	foundIds := make(map[string]string)
+	var lookupErrors []LookupError
+
+	hierarchy := []string{"PHASE", "ZONE", "BUILDING", "UNIT", "DESIGN_TYPE"}
+
+	for _, entityType := range hierarchy {
+		docsAtLevel := entityLevels[entityType]
+		if len(docsAtLevel) == 0 {
+			continue
+		}
+
+		logger.Info("Processing %d documents for entity type: %s", len(docsAtLevel), entityType)
+
+		parentGroups := make(map[string][]models.DocumentInfo)
+		var currentLookupErrors []LookupError
+
+		for _, doc := range docsAtLevel {
+			parentKey := getParentKey(entityType, doc.NamePath)
+			if parentKey != "" {
+				if _, exists := foundIds[parentKey]; !exists {
+					currentLookupErrors = append(currentLookupErrors, LookupError{
+						EntityType: entityType,
+						Path:       generateFullPath(doc),
+						Details:    fmt.Sprintf("Parent entity not found for %s", entityType),
+					})
+					continue
 				}
-				documents[i].SalesforceIds[strings.ToLower(documents[i].EntityType)] = resultId
-				gui.Log("Found ID for %s: %s", documents[i].FilePath, resultId)
-				found = true
-				break
+			}
+			key := generateFullPath(doc)
+			parentGroups[key] = append(parentGroups[key], doc)
+		}
+
+		if len(currentLookupErrors) > 0 {
+			lookupErrors = append(lookupErrors, currentLookupErrors...)
+			continue
+		}
+
+		var bulkRequest models.BulkLookupRequest
+		processedPaths := make(map[string]bool)
+
+		for _, docs := range parentGroups {
+			path := generateFullPath(docs[0])
+			if !processedPaths[path] {
+				bulkRequest.Lookups = append(bulkRequest.Lookups, models.EntityLookup{
+					EntityType: entityType,
+					NamePath:   docs[0].NamePath,
+				})
+				processedPaths[path] = true
 			}
 		}
 
-		if !found {
-			errMsg := fmt.Sprintf("no lookup result found for %s", documents[i].FilePath)
-			gui.Log("Error: %s", errMsg)
-			return fmt.Errorf(errMsg)
+		if len(bulkRequest.Lookups) == 0 {
+			continue
 		}
+
+		results, err := executeBulkLookup(accessToken, bulkRequest, logger)
+		if err != nil {
+			return err
+		}
+
+		for path, docs := range parentGroups {
+			// found := false
+			for resultKey, resultId := range results {
+				var resultLookup models.EntityLookup
+				if err := json.Unmarshal([]byte(resultKey), &resultLookup); err != nil {
+					continue
+				}
+
+				if compareNamePaths(resultLookup.NamePath, docs[0].NamePath) {
+					if strings.HasPrefix(resultId, "ERROR:") {
+						currentLookupErrors = append(currentLookupErrors, LookupError{
+							EntityType: entityType,
+							Path:       path,
+							Details:    resultId,
+						})
+					} else {
+						idKey := strings.ToLower(entityType)
+						foundIds[fmt.Sprintf("%s_%s", entityType, docs[0].NamePath[idKey])] = resultId
+						for _, doc := range docs {
+							doc.SalesforceIds[idKey] = resultId
+						}
+						// found = true
+					}
+					break
+				}
+			}
+
+			// fmt.Println(found)
+			// if !found {
+			// 	currentLookupErrors = append(currentLookupErrors, LookupError{
+			// 		EntityType: entityType,
+			// 		Path:       path,
+			// 		Details:    "Not found in Salesforce",
+			// 	})
+			// }
+		}
+
+		lookupErrors = append(lookupErrors, currentLookupErrors...)
 	}
 
+	if len(lookupErrors) > 0 {
+		errorMsg := "The following entities were not found:\n"
+		for _, err := range lookupErrors {
+			errorMsg += fmt.Sprintf("- %s: %s\n  Details: %s\n",
+				err.EntityType, err.Path, err.Details)
+			logger.Error("%s not found: %s (%s)", err.EntityType, err.Path, err.Details)
+		}
+		return fmt.Errorf(errorMsg)
+	}
+
+	logger.Info("Successfully completed bulk entity lookup")
 	return nil
 }
 
-func bulkUploadContentVersions(accessToken string, documents []models.DocumentInfo, gui *gui.GUI) error {
-	const batchSize = 25
+func getParentKey(entityType string, namePath map[string]string) string {
+	switch entityType {
+	case "PHASE":
+		return ""
+	case "ZONE":
+		return fmt.Sprintf("PHASE_%s", namePath["phase"])
+	case "BUILDING":
+		return fmt.Sprintf("ZONE_%s", namePath["zone"])
+	case "UNIT":
+		return fmt.Sprintf("BUILDING_%s", namePath["building"])
+	case "DESIGN_TYPE":
+		return fmt.Sprintf("PHASE_%s", namePath["phase"])
+	default:
+		return ""
+	}
+}
+
+func bulkUploadContentVersions(accessToken string, documents []models.DocumentInfo, logger *logging.Logger, app *gui.App) error {
+	// TODO Change
+	const batchSize = 1
 
 	var allRequests []map[string]any
-	gui.Log("Preparing content version upload requests")
+	logger.Info("Preparing content version upload requests")
+
+	totalBatches := (len(documents) + batchSize - 1) / batchSize
+	currentBatch := 0
+	progressStart := 0.4
+	progressEnd := 0.8
+	progressPerBatch := (progressEnd - progressStart) / float64(totalBatches)
+
 	for i, doc := range documents {
-		// Construct the full path using the relative path components
 		fullPath := filepath.Join("./documents", filepath.Dir(doc.RelativePath), doc.FilePath)
 
 		fileBytes, err := os.ReadFile(fullPath)
 		if err != nil {
 			errMsg := fmt.Sprintf("error reading file %s: %v", fullPath, err)
-			gui.Log("Error: %s", errMsg)
+			logger.Error(errMsg)
 			return fmt.Errorf(errMsg)
 		}
 
@@ -159,16 +322,18 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 			},
 		}
 		allRequests = append(allRequests, request)
-		gui.Log("Prepared request for file: %s", fullPath)
+		logger.Debug("Prepared request for file: %s", fullPath)
 	}
-
-	totalBatches := (len(allRequests) + batchSize - 1) / batchSize
-	currentBatch := 0
 
 	for i := 0; i < len(allRequests); i += batchSize {
 		currentBatch++
 		end := min(i+batchSize, len(allRequests))
-		gui.Log("Processing batch %d of %d (%d files)", currentBatch, totalBatches, end-i)
+		logger.Info("Processing batch %d of %d (%d files)", currentBatch, totalBatches, end-i)
+
+		progress := progressStart + (float64(currentBatch) * progressPerBatch)
+		app.SetProgress(progress)
+
+		logger.Info("Processing batch %d of %d (%d files)", currentBatch, totalBatches, end-i)
 
 		batchRequests := allRequests[i:end]
 		compositeRequest := map[string]any{
@@ -178,6 +343,7 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 
 		jsonBody, err := json.Marshal(compositeRequest)
 		if err != nil {
+			logger.Error("Failed to marshal composite request: %v", err)
 			return fmt.Errorf("error marshaling request: %v", err)
 		}
 
@@ -185,15 +351,17 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 			config.SFInstanceURL+"/services/data/v57.0/composite",
 			bytes.NewBuffer(jsonBody))
 		if err != nil {
+			logger.Error("Failed to create composite request: %v", err)
 			return fmt.Errorf("error creating composite request: %v", err)
 		}
 
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		req.Header.Set("Content-Type", "application/json")
 
-		gui.Log("Sending batch request to Salesforce")
+		logger.Debug("Sending batch request to Salesforce")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
+			logger.Error("Failed to execute composite request: %v", err)
 			return fmt.Errorf("composite request failed: %v", err)
 		}
 		defer resp.Body.Close()
@@ -207,6 +375,7 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&compositeResponse); err != nil {
+			logger.Error("Failed to decode composite response: %v", err)
 			return fmt.Errorf("error decoding composite response: %v", err)
 		}
 
@@ -214,7 +383,7 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 			if result.HttpStatusCode != 201 {
 				errMsg := fmt.Sprintf("failed to create ContentVersion for reference %s: status %d",
 					result.ReferenceId, result.HttpStatusCode)
-				gui.Log("Error: %s", errMsg)
+				logger.Error(errMsg)
 				return fmt.Errorf(errMsg)
 			}
 
@@ -223,14 +392,14 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 				if refIndex < len(documents) {
 					versionId := successBody["id"].(string)
 					documents[refIndex].SalesforceIds["contentVersionId"] = versionId
-					gui.Log("Created ContentVersion with ID: %s for file: %s",
+					logger.Debug("Created ContentVersion with ID: %s for file: %s",
 						versionId, documents[refIndex].FilePath)
 				}
 			}
 		}
 	}
 
-	gui.Log("Retrieving ContentDocument IDs")
+	logger.Info("Retrieving ContentDocument IDs")
 	var versionIds []string
 	for _, doc := range documents {
 		if id, ok := doc.SalesforceIds["contentVersionId"]; ok {
@@ -249,6 +418,7 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 
 		req, err := http.NewRequest("GET", queryURL, nil)
 		if err != nil {
+			logger.Error("Failed to create query request: %v", err)
 			return fmt.Errorf("error creating query request: %v", err)
 		}
 
@@ -256,6 +426,7 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
+			logger.Error("Failed to execute query request: %v", err)
 			return fmt.Errorf("query request failed: %v", err)
 		}
 		defer resp.Body.Close()
@@ -268,13 +439,14 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&queryResult); err != nil {
+			logger.Error("Failed to decode query response: %v", err)
 			return fmt.Errorf("error decoding query response: %v", err)
 		}
 
 		cdIdMap := make(map[string]string)
 		for _, record := range queryResult.Records {
 			cdIdMap[record.Id] = record.ContentDocumentId
-			gui.Log("Mapping ContentVersion %s to ContentDocument %s",
+			logger.Debug("Mapping ContentVersion %s to ContentDocument %s",
 				record.Id, record.ContentDocumentId)
 		}
 
@@ -282,40 +454,41 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 			if versionId, ok := documents[i].SalesforceIds["contentVersionId"]; ok {
 				if contentDocId, ok := cdIdMap[versionId]; ok {
 					documents[i].ContentDocumentId = contentDocId
-					gui.Log("Set ContentDocumentId %s for file %s",
+					logger.Debug("Set ContentDocumentId %s for file %s",
 						contentDocId, documents[i].FilePath)
 				}
 			}
 		}
 	}
 
-	gui.Log("Verifying ContentDocument IDs")
+	logger.Info("Verifying ContentDocument IDs")
 	for i := range documents {
 		if documents[i].ContentDocumentId == "" {
 			errMsg := fmt.Sprintf("ContentDocumentId not set for file: %s (VersionId: %s)",
 				documents[i].FilePath, documents[i].SalesforceIds["contentVersionId"])
-			gui.Log("Error: %s", errMsg)
+			logger.Error(errMsg)
 			return fmt.Errorf("failed to get ContentDocumentId for file: %s", documents[i].FilePath)
 		}
 	}
 
+	logger.Info("Successfully completed content version uploads")
 	return nil
 }
 
-func bulkCreateAttachmentUploaders(accessToken string, documents []models.DocumentInfo, gui *gui.GUI) error {
+func bulkCreateAttachmentUploaders(accessToken string, documents []models.DocumentInfo, logger *logging.Logger) error {
 	const batchSize = 25
-	gui.Log("Starting attachment uploader creation")
+	logger.Info("Starting attachment uploader creation")
 
 	var allRequests []map[string]any
 	for i, doc := range documents {
-		gui.Log("Processing document: %s", doc.FilePath)
-		gui.Log("ContentDocumentId: %s", doc.ContentDocumentId)
-		gui.Log("EntityType: %s", doc.EntityType)
-		gui.Log("Available SalesforceIds: %+v", doc.SalesforceIds)
+		logger.Debug("Processing document: %s", doc.FilePath)
+		logger.Debug("ContentDocumentId: %s", doc.ContentDocumentId)
+		logger.Debug("EntityType: %s", doc.EntityType)
+		logger.Debug("Available SalesforceIds: %+v", doc.SalesforceIds)
 
 		if doc.ContentDocumentId == "" {
 			errMsg := fmt.Sprintf("Missing ContentDocumentId for document: %s", doc.FilePath)
-			gui.Log("Error: %s", errMsg)
+			logger.Error(errMsg)
 			continue
 		}
 
@@ -335,7 +508,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 
 		if entityId == "" {
 			errMsg := fmt.Sprintf("Missing %s ID for document: %s", doc.EntityType, doc.FilePath)
-			gui.Log("Error: %s", errMsg)
+			logger.Error(errMsg)
 			continue
 		}
 
@@ -364,7 +537,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 			record["Design_Type__c"] = entityId
 		}
 
-		gui.Log("Creating attachment uploader record for: %s", doc.FilePath)
+		logger.Debug("Creating attachment uploader record for: %s", doc.FilePath)
 
 		request := map[string]any{
 			"method":      "POST",
@@ -376,7 +549,9 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 	}
 
 	if len(allRequests) == 0 {
-		return fmt.Errorf("no valid records to create")
+		errMsg := "no valid records to create"
+		logger.Error(errMsg)
+		return fmt.Errorf(errMsg)
 	}
 
 	totalBatches := (len(allRequests) + batchSize - 1) / batchSize
@@ -385,7 +560,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 	for i := 0; i < len(allRequests); i += batchSize {
 		currentBatch++
 		end := min(i+batchSize, len(allRequests))
-		gui.Log("Processing batch %d of %d (%d records)", currentBatch, totalBatches, end-i)
+		logger.Info("Processing batch %d of %d (%d records)", currentBatch, totalBatches, end-i)
 
 		batchRequests := allRequests[i:end]
 		compositeRequest := map[string]any{
@@ -394,12 +569,13 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 		}
 
 		jsonBody, _ := json.Marshal(compositeRequest)
-		gui.Log("Sending attachment uploader request")
+		logger.Debug("Sending attachment uploader request")
 
 		req, err := http.NewRequest("POST",
 			config.SFInstanceURL+"/services/data/v57.0/composite",
 			bytes.NewBuffer(jsonBody))
 		if err != nil {
+			logger.Error("Failed to create composite request: %v", err)
 			return fmt.Errorf("error creating composite request: %v", err)
 		}
 
@@ -408,12 +584,13 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
+			logger.Error("Failed to execute composite request: %v", err)
 			return fmt.Errorf("composite request failed: %v", err)
 		}
 		defer resp.Body.Close()
 
 		body, _ := io.ReadAll(resp.Body)
-		gui.Log("Received attachment uploader response: %s", string(body))
+		logger.Debug("Received attachment uploader response: %s", string(body))
 
 		var compositeResponse struct {
 			CompositeResponse []struct {
@@ -424,6 +601,7 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 		}
 
 		if err := json.Unmarshal(body, &compositeResponse); err != nil {
+			logger.Error("Failed to decode composite response: %v", err)
 			return fmt.Errorf("error decoding composite response: %v", err)
 		}
 
@@ -433,23 +611,23 @@ func bulkCreateAttachmentUploaders(accessToken string, documents []models.Docume
 					if errMap, ok := errArray[0].(map[string]any); ok {
 						errMsg := fmt.Sprintf("failed to create Attachments_Uploader__c: %v - %v",
 							errMap["errorCode"], errMap["message"])
-						gui.Log("Error: %s", errMsg)
+						logger.Error(errMsg)
 						return fmt.Errorf(errMsg)
 					}
 				}
 				errMsg := fmt.Sprintf("failed to create Attachments_Uploader__c for reference %s: status %d",
 					result.ReferenceId, result.HttpStatusCode)
-				gui.Log("Error: %s", errMsg)
+				logger.Error(errMsg)
 				return fmt.Errorf(errMsg)
 			}
 
 			if successBody, ok := result.Body.(map[string]any); ok {
-				gui.Log("Created Attachments_Uploader__c with ID: %v", successBody["id"])
+				logger.Debug("Created Attachments_Uploader__c with ID: %v", successBody["id"])
 			}
 		}
 	}
 
-	gui.Log("Successfully created all attachment uploaders")
+	logger.Info("Successfully created all attachment uploaders")
 	return nil
 }
 
@@ -475,7 +653,7 @@ func min(a, b int) int {
 func getContentType(filename string) string {
 	mime, err := mimetype.DetectFile(filename)
 	if err != nil {
-		return config.ContentTypeImage // default to image if detection fails
+		return config.ContentTypeImage
 	}
 
 	mainType := strings.Split(mime.String(), "/")[0]
@@ -532,5 +710,39 @@ func generateDisplayValue(doc models.DocumentInfo) string {
 
 	default:
 		return strings.TrimSuffix(filepath.Base(doc.FilePath), filepath.Ext(doc.FilePath))
+	}
+}
+
+func generateFullPath(doc models.DocumentInfo) string {
+	switch doc.EntityType {
+	case "UNIT":
+		return fmt.Sprintf("%s/Phase %s/Zone %s/Building %s/Unit %s",
+			doc.NamePath["project"],
+			doc.NamePath["phase"],
+			doc.NamePath["zone"],
+			doc.NamePath["building"],
+			doc.NamePath["unit"])
+	case "BUILDING":
+		return fmt.Sprintf("%s/Phase %s/Zone %s/Building %s",
+			doc.NamePath["project"],
+			doc.NamePath["phase"],
+			doc.NamePath["zone"],
+			doc.NamePath["building"])
+	case "ZONE":
+		return fmt.Sprintf("%s/Phase %s/Zone %s",
+			doc.NamePath["project"],
+			doc.NamePath["phase"],
+			doc.NamePath["zone"])
+	case "PHASE":
+		return fmt.Sprintf("%s/Phase %s",
+			doc.NamePath["project"],
+			doc.NamePath["phase"])
+	case "DESIGN_TYPE":
+		return fmt.Sprintf("%s/Phase %s/Design Type %s",
+			doc.NamePath["project"],
+			doc.NamePath["phase"],
+			doc.NamePath["designType"])
+	default:
+		return doc.FilePath
 	}
 }

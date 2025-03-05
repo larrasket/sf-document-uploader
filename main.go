@@ -14,42 +14,34 @@ var env embed.FS
 
 func main() {
 	config.LoadEnv(env)
+	app := gui.NewApp()
 
-	gui, err := gui.New()
-	if err != nil {
-		panic(err)
-	}
-	defer gui.Close()
-
-	go func() {
-		gui.Log("Starting document processing...")
-		gui.SetStatus("Authenticating...")
-		gui.SetProgress(0.1)
+	// Add processing functionality
+	app.SetProcessingHandler(func() {
+		app.SetStatus("Authenticating...")
+		app.SetProgress(0.1)
 
 		tokenResp, err := auth.Authenticate()
 		if err != nil {
-			gui.Log("Authentication failed: %v", err)
-			gui.ShowError("Authentication Error", err.Error())
-			gui.Quit()
-			return
-		}
-		gui.Log("Successfully authenticated")
-		gui.SetProgress(0.3)
-
-		gui.SetStatus("Processing documents...")
-		err = processor.ProcessDocuments(tokenResp.AccessToken, "./documents", gui)
-		if err != nil {
-			gui.Log("Document processing failed: %v", err)
-			gui.ShowError("Processing Error", err.Error())
-			gui.Quit()
+			app.AddLog("Authentication failed: " + err.Error())
+			app.ShowError("Authentication Error", err.Error())
+			app.Reset()
 			return
 		}
 
-		gui.SetProgress(1.0)
-		gui.SetStatus("Completed")
-		gui.Log("Document processing completed successfully")
-	}()
+		app.AddLog("Authentication successful")
 
-	gui.Show()
+		if err := processor.ProcessDocuments(tokenResp.AccessToken, app.GetDocumentsPath(), app); err != nil {
+			app.AddLog("Processing failed: " + err.Error())
+			app.ShowError("Processing Error", err.Error())
+			app.Reset()
+			return
+		}
 
+		app.SetProgress(1.0)
+		app.SetStatus("Completed")
+		app.AddLog("Processing completed successfully")
+	})
+
+	app.Run()
 }

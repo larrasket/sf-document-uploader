@@ -17,7 +17,6 @@ var (
 	envMap        map[string]string
 )
 
-// Document Types
 const (
 	DocTypeBuildingLocation = "Building Location"
 	DocTypeFinish           = "Finish"
