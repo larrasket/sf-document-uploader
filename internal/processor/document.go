@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -68,7 +67,7 @@ func ProcessDocuments(accessToken, documentsDir string, app *gui.App) error {
 	app.SetProgress(0.4)
 
 	app.SetStatus("Uploading content...")
-	if err := bulkUploadContentVersions(accessToken, documents, logger, app); err != nil {
+	if err := bulkUploadContentVersions(accessToken, documentsDir, documents, logger, app); err != nil {
 		logger.Error("Bulk content upload failed: %v", err)
 		return fmt.Errorf("bulk content upload failed: %v", err)
 	}
@@ -150,60 +149,108 @@ func executeBulkLookup(accessToken string, bulkRequest models.BulkLookupRequest,
 func bulkLookupEntities(accessToken string, documents []models.DocumentInfo, logger *logging.Logger) error {
 	logger.Info("Starting bulk entity lookup for %d documents", len(documents))
 
-	entityLevels := make(map[string][]models.DocumentInfo)
-	for _, doc := range documents {
-		entityLevels[doc.EntityType] = append(entityLevels[doc.EntityType], doc)
-	}
-
+	pathsByLevel := make(map[string]map[string]models.DocumentInfo)
 	foundIds := make(map[string]string)
 	var lookupErrors []LookupError
 
-	hierarchy := []string{"PHASE", "ZONE", "BUILDING", "UNIT", "DESIGN_TYPE"}
+	levels := []string{"PHASE", "ZONE", "BUILDING", "UNIT", "DESIGN_TYPE"}
+	for _, level := range levels {
+		pathsByLevel[level] = make(map[string]models.DocumentInfo)
+	}
 
-	for _, entityType := range hierarchy {
-		docsAtLevel := entityLevels[entityType]
-		if len(docsAtLevel) == 0 {
+	for _, doc := range documents {
+		switch doc.EntityType {
+		case "UNIT":
+			pathsByLevel["PHASE"][doc.NamePath["phase"]] = models.DocumentInfo{
+				EntityType: "PHASE",
+				NamePath: map[string]string{
+					"project": doc.NamePath["project"],
+					"phase":   doc.NamePath["phase"],
+				},
+			}
+			pathsByLevel["ZONE"][doc.NamePath["zone"]] = models.DocumentInfo{
+				EntityType: "ZONE",
+				NamePath: map[string]string{
+					"project": doc.NamePath["project"],
+					"phase":   doc.NamePath["phase"],
+					"zone":    doc.NamePath["zone"],
+				},
+			}
+			pathsByLevel["BUILDING"][doc.NamePath["building"]] = models.DocumentInfo{
+				EntityType: "BUILDING",
+				NamePath: map[string]string{
+					"project":  doc.NamePath["project"],
+					"phase":    doc.NamePath["phase"],
+					"zone":     doc.NamePath["zone"],
+					"building": doc.NamePath["building"],
+				},
+			}
+			pathsByLevel["UNIT"][doc.NamePath["unit"]] = doc
+
+		case "BUILDING":
+			pathsByLevel["PHASE"][doc.NamePath["phase"]] = models.DocumentInfo{
+				EntityType: "PHASE",
+				NamePath: map[string]string{
+					"project": doc.NamePath["project"],
+					"phase":   doc.NamePath["phase"],
+				},
+			}
+			pathsByLevel["ZONE"][doc.NamePath["zone"]] = models.DocumentInfo{
+				EntityType: "ZONE",
+				NamePath: map[string]string{
+					"project": doc.NamePath["project"],
+					"phase":   doc.NamePath["phase"],
+					"zone":    doc.NamePath["zone"],
+				},
+			}
+			pathsByLevel["BUILDING"][doc.NamePath["building"]] = doc
+
+		case "ZONE":
+			pathsByLevel["PHASE"][doc.NamePath["phase"]] = models.DocumentInfo{
+				EntityType: "PHASE",
+				NamePath: map[string]string{
+					"project": doc.NamePath["project"],
+					"phase":   doc.NamePath["phase"],
+				},
+			}
+			pathsByLevel["ZONE"][doc.NamePath["zone"]] = doc
+
+		case "PHASE":
+			pathsByLevel["PHASE"][doc.NamePath["phase"]] = doc
+
+		case "DESIGN_TYPE":
+			pathsByLevel["PHASE"][doc.NamePath["phase"]] = models.DocumentInfo{
+				EntityType: "PHASE",
+				NamePath: map[string]string{
+					"project": doc.NamePath["project"],
+					"phase":   doc.NamePath["phase"],
+				},
+			}
+			pathsByLevel["DESIGN_TYPE"][doc.NamePath["designType"]] = doc
+		}
+	}
+
+	for _, entityType := range levels {
+		paths := pathsByLevel[entityType]
+		if len(paths) == 0 {
 			continue
 		}
 
-		logger.Info("Processing %d documents for entity type: %s", len(docsAtLevel), entityType)
+		logger.Info("Processing entity type: %s", entityType)
 
-		parentGroups := make(map[string][]models.DocumentInfo)
-		var currentLookupErrors []LookupError
-
-		for _, doc := range docsAtLevel {
+		var bulkRequest models.BulkLookupRequest
+		for _, doc := range paths {
 			parentKey := getParentKey(entityType, doc.NamePath)
 			if parentKey != "" {
 				if _, exists := foundIds[parentKey]; !exists {
-					currentLookupErrors = append(currentLookupErrors, LookupError{
-						EntityType: entityType,
-						Path:       generateFullPath(doc),
-						Details:    fmt.Sprintf("Parent entity not found for %s", entityType),
-					})
+					logger.Error("Parent not found: %s for %s", parentKey, generateFullPath(doc))
 					continue
 				}
 			}
-			key := generateFullPath(doc)
-			parentGroups[key] = append(parentGroups[key], doc)
-		}
-
-		if len(currentLookupErrors) > 0 {
-			lookupErrors = append(lookupErrors, currentLookupErrors...)
-			continue
-		}
-
-		var bulkRequest models.BulkLookupRequest
-		processedPaths := make(map[string]bool)
-
-		for _, docs := range parentGroups {
-			path := generateFullPath(docs[0])
-			if !processedPaths[path] {
-				bulkRequest.Lookups = append(bulkRequest.Lookups, models.EntityLookup{
-					EntityType: entityType,
-					NamePath:   docs[0].NamePath,
-				})
-				processedPaths[path] = true
-			}
+			bulkRequest.Lookups = append(bulkRequest.Lookups, models.EntityLookup{
+				EntityType: entityType,
+				NamePath:   doc.NamePath,
+			})
 		}
 
 		if len(bulkRequest.Lookups) == 0 {
@@ -215,44 +262,32 @@ func bulkLookupEntities(accessToken string, documents []models.DocumentInfo, log
 			return err
 		}
 
-		for path, docs := range parentGroups {
-			// found := false
-			for resultKey, resultId := range results {
-				var resultLookup models.EntityLookup
-				if err := json.Unmarshal([]byte(resultKey), &resultLookup); err != nil {
-					continue
-				}
-
-				if compareNamePaths(resultLookup.NamePath, docs[0].NamePath) {
-					if strings.HasPrefix(resultId, "ERROR:") {
-						currentLookupErrors = append(currentLookupErrors, LookupError{
-							EntityType: entityType,
-							Path:       path,
-							Details:    resultId,
-						})
-					} else {
-						idKey := strings.ToLower(entityType)
-						foundIds[fmt.Sprintf("%s_%s", entityType, docs[0].NamePath[idKey])] = resultId
-						for _, doc := range docs {
-							doc.SalesforceIds[idKey] = resultId
-						}
-						// found = true
-					}
-					break
-				}
+		for resultKey, resultId := range results {
+			var resultLookup models.EntityLookup
+			if err := json.Unmarshal([]byte(resultKey), &resultLookup); err != nil {
+				continue
 			}
 
-			// fmt.Println(found)
-			// if !found {
-			// 	currentLookupErrors = append(currentLookupErrors, LookupError{
-			// 		EntityType: entityType,
-			// 		Path:       path,
-			// 		Details:    "Not found in Salesforce",
-			// 	})
-			// }
-		}
+			if strings.HasPrefix(resultId, "ERROR:") {
+				lookupErrors = append(lookupErrors, LookupError{
+					EntityType: entityType,
+					Path:       generateFullPath(models.DocumentInfo{EntityType: entityType, NamePath: resultLookup.NamePath}),
+					Details:    resultId,
+				})
+				continue
+			}
 
-		lookupErrors = append(lookupErrors, currentLookupErrors...)
+			idKey := strings.ToLower(entityType)
+			key := fmt.Sprintf("%s_%s", entityType, resultLookup.NamePath[idKey])
+			foundIds[key] = resultId
+			logger.Debug("Found ID for %s: %s", key, resultId)
+
+			for i := range documents {
+				if documents[i].EntityType == entityType && compareNamePaths(resultLookup.NamePath, documents[i].NamePath) {
+					documents[i].SalesforceIds[idKey] = resultId
+				}
+			}
+		}
 	}
 
 	if len(lookupErrors) > 0 {
@@ -260,7 +295,6 @@ func bulkLookupEntities(accessToken string, documents []models.DocumentInfo, log
 		for _, err := range lookupErrors {
 			errorMsg += fmt.Sprintf("- %s: %s\n  Details: %s\n",
 				err.EntityType, err.Path, err.Details)
-			logger.Error("%s not found: %s (%s)", err.EntityType, err.Path, err.Details)
 		}
 		return fmt.Errorf(errorMsg)
 	}
@@ -286,7 +320,7 @@ func getParentKey(entityType string, namePath map[string]string) string {
 	}
 }
 
-func bulkUploadContentVersions(accessToken string, documents []models.DocumentInfo, logger *logging.Logger, app *gui.App) error {
+func bulkUploadContentVersions(accessToken string, documentsDir string, documents []models.DocumentInfo, logger *logging.Logger, app *gui.App) error {
 	const batchSize = 25
 
 	var allRequests []map[string]any
@@ -299,8 +333,9 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 	progressPerBatch := (progressEnd - progressStart) / float64(totalBatches)
 
 	for i, doc := range documents {
-		fullPath := filepath.Join("./documents", filepath.Dir(doc.RelativePath), doc.FilePath)
+		fullPath := filepath.Clean(filepath.Join(documentsDir, doc.RelativePath))
 
+		logger.Debug("Reading file from path: %s", fullPath)
 		fileBytes, err := os.ReadFile(fullPath)
 		if err != nil {
 			errMsg := fmt.Sprintf("error reading file %s: %v", fullPath, err)
@@ -394,78 +429,6 @@ func bulkUploadContentVersions(accessToken string, documents []models.DocumentIn
 						versionId, documents[refIndex].FilePath)
 				}
 			}
-		}
-	}
-
-	logger.Info("Retrieving ContentDocument IDs")
-	var versionIds []string
-	for _, doc := range documents {
-		if id, ok := doc.SalesforceIds["contentVersionId"]; ok {
-			versionIds = append(versionIds, "'"+id+"'")
-		}
-	}
-
-	if len(versionIds) > 0 {
-		soql := fmt.Sprintf(
-			"SELECT Id, ContentDocumentId FROM ContentVersion WHERE Id IN (%s)",
-			strings.Join(versionIds, ","))
-
-		queryURL := fmt.Sprintf("%s/services/data/v57.0/query?q=%s",
-			config.SFInstanceURL,
-			url.QueryEscape(soql))
-
-		req, err := http.NewRequest("GET", queryURL, nil)
-		if err != nil {
-			logger.Error("Failed to create query request: %v", err)
-			return fmt.Errorf("error creating query request: %v", err)
-		}
-
-		req.Header.Set("Authorization", "Bearer "+accessToken)
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			logger.Error("Failed to execute query request: %v", err)
-			return fmt.Errorf("query request failed: %v", err)
-		}
-		defer resp.Body.Close()
-
-		var queryResult struct {
-			Records []struct {
-				Id                string `json:"Id"`
-				ContentDocumentId string `json:"ContentDocumentId"`
-			} `json:"records"`
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&queryResult); err != nil {
-			logger.Error("Failed to decode query response: %v", err)
-			return fmt.Errorf("error decoding query response: %v", err)
-		}
-
-		cdIdMap := make(map[string]string)
-		for _, record := range queryResult.Records {
-			cdIdMap[record.Id] = record.ContentDocumentId
-			logger.Debug("Mapping ContentVersion %s to ContentDocument %s",
-				record.Id, record.ContentDocumentId)
-		}
-
-		for i := range documents {
-			if versionId, ok := documents[i].SalesforceIds["contentVersionId"]; ok {
-				if contentDocId, ok := cdIdMap[versionId]; ok {
-					documents[i].ContentDocumentId = contentDocId
-					logger.Debug("Set ContentDocumentId %s for file %s",
-						contentDocId, documents[i].FilePath)
-				}
-			}
-		}
-	}
-
-	logger.Info("Verifying ContentDocument IDs")
-	for i := range documents {
-		if documents[i].ContentDocumentId == "" {
-			errMsg := fmt.Sprintf("ContentDocumentId not set for file: %s (VersionId: %s)",
-				documents[i].FilePath, documents[i].SalesforceIds["contentVersionId"])
-			logger.Error(errMsg)
-			return fmt.Errorf("failed to get ContentDocumentId for file: %s", documents[i].FilePath)
 		}
 	}
 

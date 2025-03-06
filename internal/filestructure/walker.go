@@ -38,6 +38,7 @@ func (w *DocumentWalker) processPath(path string, info os.FileInfo, err error) e
 		return nil
 	}
 
+	// Get relative path from documents directory
 	relPath, err := filepath.Rel(w.documentsDir, path)
 	if err != nil {
 		return err
@@ -52,6 +53,7 @@ func (w *DocumentWalker) processPath(path string, info os.FileInfo, err error) e
 	}
 
 	if docInfo != nil {
+		docInfo.FilePath = fileName
 		docInfo.RelativePath = relPath
 		w.documents = append(w.documents, *docInfo)
 	}
